@@ -1,0 +1,371 @@
+---
+title: "calculate_windows_around_450K_EPIC_CpGs"
+output: html_document
+author: Dana Silverbush
+input: TCGA publicly available glioma DNA methylation data
+output: windows around the EPIC array CpGs
+usage in Chaligne et al: input for DNAme bulk-trained classifier and DNAme single cell clustering
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## R Markdown
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(plotrix)
+library(stringr)
+library(useful)
+library(glmnet)
+library(igraph)
+
+# Replace with the path to your directories
+figures.dir <- "/Volumes/broad_regevtmp/dsilverb/Glioma_scRRBS/figures/GBM/"
+scRRBS.dir <- "/Volumes/broad_regevtmp/dsilverb/Glioma_scRRBS/RRBS/"
+signature.dir = "/Volumes/ahg_regevdata/projects/Glioma_scGenetics/resources/genesignatures/"
+resources.dir =  "/Volumes/broad_regevtmp/dsilverb/Glioma_scRRBS/resources/"
+results.dir =  "/Volumes/broad_regevtmp/dsilverb/Glioma_scRRBS/results/GBM/"
+classification.dir <- "/Users/dsilverb/Dropbox/PostDoc/Glioma_scRRBS/Classification/"
+
+```
+
+
+
+```{r DRead }
+
+library(readr)
+library(readxl)
+library(dplyr)
+#library(randomForest)
+library(doMC)
+#library(e1071)
+
+# Control random number generation
+set.seed(210) # set a seed to RNG
+
+# register number of cores to be used for parallel evaluation
+registerDoMC(cores = parallel::detectCores())
+
+# DNA methylation matrix
+file <- paste0(resources.dir, "DNAmetBulkSignatures/LGG.GBM.meth.txt") # This file is provided by the study "Molecular profiling reveals biologically discrete subsets and pathways of progression in diffuse glioma", Ceccarelli et al., accessible via TCGA database
+LGG.GBM <- as.data.frame(readr::read_tsv(file))
+rownames(LGG.GBM) <- LGG.GBM$Composite.Element.REF
+idx <- grep("TCGA",colnames(LGG.GBM))
+colnames(LGG.GBM)[idx] <- substr(colnames(LGG.GBM)[idx], 1, 12) # reduce complete barcode to sample identifier (first 12 characters) 
+
+# metadata with samples molecular subtypes
+library(DT)
+file <- paste0(resources.dir, "DNAmetBulkSignatures/mmc2.xlsx") # This file is provided by the study "Molecular profiling reveals biologically discrete subsets and pathways of progression in diffuse glioma"
+metadata <-  readxl::read_excel(file, sheet = "S1A. TCGA discovery dataset", skip = 1)
+DT::datatable(metadata[,c("Case",
+                          "Pan-Glioma DNA Methylation Cluster",
+                          "Supervised DNA Methylation Cluster",
+                          "IDH-specific DNA Methylation Cluster")])
+
+#Probes metadata information are downloaded from http://zwdzwd.io/InfiniumAnnotation This will be used to remove probes that should be masked from the training.
+file <- "http://zwdzwd.io/InfiniumAnnotation/20170313/EPIC/EPIC.manifest.hg38.rda"
+if(!file.exists(basename(file))) downloader::download(file,basename(file))
+load(basename(file))
+
+
+# load signatures
+signatures.file <- paste0(resources.dir, "DNAmetBulkSignatures/PanGlioma_MethylationSignatures.xlsx") # This file is provided by the study "Molecular profiling reveals biologically discrete subsets and pathways of progression in diffuse glioma"
+trainingcol <- 'IDH status'
+
+
+# prepare training data
+sheet <- "1,300 pan-glioma tumor specific"
+trainingset <- grep("Mutant|WT",unique(metadata$`IDH status`),value = T)
+#trainingset <- grep("LGm1|LGm2|LGm3|LGm4|LGm5|LGm6",unique(metadata$'Pan-Glioma DNA Methylation Cluster'),value = T)
+
+# The DNA methylation matrix will be subset to the DNA methylation signatures and samples with classification.
+plat <- "EPIC"
+signature.probes <-  read_excel(signatures.file,  sheet = sheet)  %>% pull(1) 
+#samples <- dplyr::filter(metadata, 'IDH-specific DNA Methylation Cluster' %in% trainingset)
+samples <- as.data.frame(metadata[metadata$`IDH status` %in% trainingset,])
+RFtrain <- LGG.GBM[signature.probes, colnames(LGG.GBM) %in% as.character(samples$Case)] %>% na.omit 
+
+# Filter signatures with EPIC?
+consider.probs <- intersect(signature.probes, names(EPIC.manifest.hg38))
+signature.probes <- consider.probs[!EPIC.manifest.hg38[consider.probs]$MASK.general]
+RFtrain <- RFtrain[signature.probes,]
+
+#merge the samples with their classification. In the end, we will have samples in the row, and probes and classification as columns.
+trainingdata <- t(RFtrain)
+trainingdata <- merge(trainingdata, metadata[,c("Case", trainingcol)], by.x=0,by.y="Case", all.x=T)
+rownames(trainingdata) <- as.character(trainingdata$Row.names)
+trainingdata$Row.names <- NULL
+
+library(gplots)
+pdf(paste0(figures.dir,"BulkvsSC/TCGA_1300_heatmap.pdf"))
+heatmap.2(as.matrix(RFtrain), trace="none") # Shortcut to final result
+dev.off()
+
+LGG.GBM$loci <- paste0(LGG.GBM$Chromosome,":",LGG.GBM$Genomic_Coordinate)
+bulk.loci.signature <- unique(LGG.GBM$loci)
+```
+
+```{r adjust bulk CpG}
+library(GenomicRanges)
+library(gUtils)
+
+WINDOW = 500 # This is half the window size (left margin and right margin, the full window in this case will be 1kb)
+TCGA_HG38_loci = read.table(paste0(resources.dir, "/DNAmetBulkSignatures/TCGA_HG38.csv"), sep = "\t", header = 1)
+patients_names <- colnames(TCGA_HG38_loci)[grep("TCGA",colnames(TCGA_HG38_loci))]
+
+LGm_probes = read.table(paste0(resources.dir, "DNAmetBulkSignatures/1300_pan_glioma_tumor_specific.csv"), sep = ",", header = 1)
+
+# In case you want just the 1300 CpGs use this
+#TCGA_HG38_loci = TCGA_HG38_loci[TCGA_HG38_loci$Composite.Element.REF %in% LGm_probes$x,]
+# In case you want all the CpGs you will need alot of memory or to filter based on another strategy Here filtering based on variability across samples:
+rowSTD <- apply(dplyr::select(TCGA_HG38_loci,contains("TCGA")),1,sd,na.rm = TRUE)
+hist(rowSTD)
+keepCpG <- (rowSTD > 0.05)
+keepCpG[is.na(keepCpG)] <- FALSE
+TCGA_HG38_loci <- TCGA_HG38_loci[keepCpG,]
+
+TCGA_HG38_loci$left_coordinate_window <- unlist(lapply(TCGA_HG38_loci$Genomic_Coordinate - WINDOW, function(x) {max(x, 0)}))
+TCGA_HG38_loci$right_coordinate_window <- unlist(lapply(TCGA_HG38_loci$Genomic_Coordinate + WINDOW, function(x) {max(x, 0)}))
+
+# Check that all windows managed to be WINDOW size
+window_size <- unlist(TCGA_HG38_loci$right_coordinate_window) - unlist(TCGA_HG38_loci$left_coordinate_window)
+
+# Check if windows are overlapping:
+
+# Create ranges
+TCGA_HG38_loci_for_mapping <- as.data.frame((TCGA_HG38_loci))
+TCGA_HG38_loci_for_mapping <- TCGA_HG38_loci_for_mapping[!is.na(TCGA_HG38_loci_for_mapping[,'left_coordinate_window']),]
+TCGA_HG38_loci_for_mapping <- TCGA_HG38_loci_for_mapping[order(TCGA_HG38_loci_for_mapping[,'Chromosome'],TCGA_HG38_loci_for_mapping[,'left_coordinate_window']),]
+rownames(TCGA_HG38_loci_for_mapping) <- 1:nrow(TCGA_HG38_loci_for_mapping)
+TCGA_HG38_loci_for_mapping <- droplevels(TCGA_HG38_loci_for_mapping)
+
+TCGA_HG38_loci_for_mapping$center = ((TCGA_HG38_loci_for_mapping$left_coordinate_window + TCGA_HG38_loci_for_mapping$right_coordinate_window)/2)
+
+left_coordinate_window <- GRanges((TCGA_HG38_loci_for_mapping$Chromosome), IRanges(start=TCGA_HG38_loci_for_mapping$center, end=TCGA_HG38_loci_for_mapping$center))
+right_coordinate_window <- GRanges((TCGA_HG38_loci_for_mapping$Chromosome), IRanges(start=TCGA_HG38_loci_for_mapping$center, end=TCGA_HG38_loci_for_mapping$center))
+
+  
+# calculate overlaps
+library(gUtils)
+df.distances<-as.data.frame(gr.dist(left_coordinate_window,right_coordinate_window))
+df.distances[df.distances==0]<-10000000
+all_overlaps <- which(df.distances < (2*WINDOW), arr.ind = TRUE)
+all_overlaps<-as.data.frame(all_overlaps)
+
+# What is the maximun distnace?
+all_overlaps$gc1 <-  TCGA_HG38_loci_for_mapping[all_overlaps[,1],"Genomic_Coordinate"]
+all_overlaps$gc2 <-  TCGA_HG38_loci_for_mapping[all_overlaps[,2],"Genomic_Coordinate"]
+all_overlaps$gc1_Chromosome <-  TCGA_HG38_loci_for_mapping[all_overlaps[,1],"Chromosome"]
+all_overlaps$gc2_Chromosome <-  TCGA_HG38_loci_for_mapping[all_overlaps[,2],"Chromosome"]
+all_overlaps$gc1_left <-  TCGA_HG38_loci_for_mapping[all_overlaps[,1],"left_coordinate_window"]
+all_overlaps$gc1_right <-  TCGA_HG38_loci_for_mapping[all_overlaps[,1],"right_coordinate_window"]
+all_overlaps$gc2_left <-  TCGA_HG38_loci_for_mapping[all_overlaps[,2],"left_coordinate_window"]
+all_overlaps$gc2_right <-  TCGA_HG38_loci_for_mapping[all_overlaps[,2],"right_coordinate_window"]
+
+isProblem = function(x){
+  if (x["gc1"] < x["gc2"]){
+    is.it <- (x["gc2_left"] < x["gc1_right"])
+  } else {
+    is.it <- (x["gc1_left"] < x["gc2_right"])
+  }
+  return(is.it)
+}
+all_overlaps$problem <-apply(all_overlaps, 1, function(x) isProblem(x))
+all_overlaps$distance <- (all_overlaps$gc1 - all_overlaps$gc2) 
+all_overlaps <- all_overlaps[all_overlaps$problem,]
+all_overlaps <- all_overlaps[all_overlaps$distance > 0,]
+
+# Create a graph from the problematic CpGs (these that are too close to one another)
+GCs <- unique(c(paste0(all_overlaps[,c("gc1_Chromosome")],":",all_overlaps[,c("gc1")]),paste0(all_overlaps[,c("gc2_Chromosome")],":",all_overlaps[,c("gc2")])))
+number_gc <- c(1:length(GCs))
+names(number_gc) <- GCs
+
+a<-lapply(paste0(all_overlaps[,c("gc1_Chromosome")],":",all_overlaps[,c("gc1")]), function(x) number_gc[as.character(x)])
+b<-lapply(paste0(all_overlaps[,c("gc2_Chromosome")],":",all_overlaps[,c("gc2")]), function(x) number_gc[as.character(x)])
+
+all_overlaps$gc1_num <- a
+all_overlaps$gc2_num <- b
+g <- graph_from_data_frame((all_overlaps[,c("gc1_num","gc2_num")]), directed = FALSE)
+g <-set.vertex.attribute(g, "name", value=GCs)
+g <-set.edge.attribute(g, "weight", value=all_overlaps[,c("distance")])
+
+# find the CpG and update its left and right
+setNewTile = function(Chromosome, Genomic_Coordinate, loci, left, right) {
+  
+  row.num <- match(TRUE, TCGA_HG38_loci$loci == loci)
+  a = TCGA_HG38_loci[row.num,]
+  #test
+  if ((a$Chromosome != Chromosome) | (a$Genomic_Coordinate != Genomic_Coordinate)) {
+    print ("Something is wrong in setNewTile")
+  }
+  else {
+    rowname <- rownames(TCGA_HG38_loci[TCGA_HG38_loci$loci == loci,])
+    TCGA_HG38_loci[rowname, "left_coordinate_window"] = left
+    TCGA_HG38_loci[rowname,"right_coordinate_window"] = right
+    print(TCGA_HG38_loci[TCGA_HG38_loci$loci == loci,"right_coordinate_window"])
+  }
+  assign('TCGA_HG38_loci',TCGA_HG38_loci,envir=.GlobalEnv)
+}
+
+
+findNewCenteredTiles = function(x) {
+  print (x)
+  print(V(g)$name[cl$membership %in% x])
+  cluster <- c(V(g)$name[cl$membership %in% x])
+  
+  # Get the genomic coordinate
+  cluster_Genomic_Coordinates <- unlist(lapply(cluster,function (x) {as.numeric(strsplit(x, ":")[[1]][2])}))
+  space <- max(cluster_Genomic_Coordinates) - min(cluster_Genomic_Coordinates)
+  
+  # If the cluster of close CpGs is less than the WINDOW then find the new center
+  if (space < (WINDOW)*2) {
+    new_center <- ((max(cluster_Genomic_Coordinates) + min(cluster_Genomic_Coordinates))/2)
+    left <- (new_center - WINDOW)
+    right <- (new_center + WINDOW)
+    
+    for (CpG in cluster)  {
+      chromosome = (strsplit(CpG,":")[[1]][1])
+      genomic.coordinate = (strsplit(CpG,":")[[1]][2])
+      setNewTile(chromosome, genomic.coordinate, CpG, floor(as.numeric(left)), floor(as.numeric(right)))
+    }
+    
+  }
+  # If the cluster is more than the WINDOW then tile the space to minimum number of non overlapping tiles
+  else {
+      # extra space needed form each side 
+      extra_space = (2*WINDOW - (space - WINDOW * floor(space/WINDOW)))-1
+      
+      # The whole new space left coordinate and right coordinate
+      left <- (min(cluster_Genomic_Coordinates) - (extra_space/2))  
+      right <- (max(cluster_Genomic_Coordinates) + (extra_space/2)) 
+      
+      # Create a range from the whole new space begining to end
+      new.range <-  IRanges(left,right)
+      
+      # Create a range from the whole new space beginnign to end
+      cluster_Chromosome <- unlist(lapply(cluster,function (x) {(strsplit(x, ":")[[1]][1])}))
+
+      # the min and max should be he same chromosome
+      #new.range <- GRanges(c(min(cluster_Chromosome)),c(left,right))
+      
+      # Break it to tiles
+      tiles <- tile(new.range, width = 2*WINDOW)
+      target_tiles <- GRanges(min(cluster_Chromosome) ,tiles[[1]])
+
+      # Match each point to a tile and set its new window
+      d <- GRanges(min(cluster_Chromosome), IRanges(cluster_Genomic_Coordinates, width=1))
+      OL <- findOverlaps(d, target_tiles)
+      hits <- target_tiles[as.data.frame(OL)[,2],]
+      df.d <- as.data.frame(d)
+      df.hits <- as.data.frame(hits)
+      for (hit in as.data.frame(OL)$queryHits) {
+        setNewTile(df.d[hit,]$seqnames, df.d[hit,]$start, cluster[hit],df.hits[1,]$start, df.hits[1,]$end)
+      }
+
+    }
+}
+
+cl <- clusters(g)
+lapply(seq_along(cl$csize)[cl$csize > 1], function(x) findNewCenteredTiles(x) )
+
+
+# If you run overlaps now it should come out empty
+
+
+# Create ranges
+TCGA_HG38_loci_for_mapping <- as.data.frame((TCGA_HG38_loci))
+TCGA_HG38_loci_for_mapping <- TCGA_HG38_loci_for_mapping[order(TCGA_HG38_loci_for_mapping[,'Chromosome'],TCGA_HG38_loci_for_mapping[,'left_coordinate_window']),]
+rownames(TCGA_HG38_loci_for_mapping) <- 1:nrow(TCGA_HG38_loci_for_mapping)
+TCGA_HG38_loci_for_mapping <- droplevels(TCGA_HG38_loci_for_mapping)
+
+TCGA_HG38_loci_for_mapping$center = ((TCGA_HG38_loci_for_mapping$left_coordinate_window + TCGA_HG38_loci_for_mapping$right_coordinate_window)/2)
+
+left_coordinate_window <- GRanges((TCGA_HG38_loci_for_mapping$Chromosome), IRanges(start=TCGA_HG38_loci_for_mapping$center, end=TCGA_HG38_loci_for_mapping$center))
+right_coordinate_window <- GRanges((TCGA_HG38_loci_for_mapping$Chromosome), IRanges(start=TCGA_HG38_loci_for_mapping$center, end=TCGA_HG38_loci_for_mapping$center))
+
+
+# calculate overlaps
+distances<-gr.dist(left_coordinate_window,right_coordinate_window)
+df.distances <- as.data.frame(distances)
+df.distances[df.distances==0]<-10000000
+all_overlaps <- which(df.distances < (2*WINDOW), arr.ind = TRUE)
+
+
+TCGA_HG38_loci$rrbs_group <- TCGA_HG38_loci$left_coordinate_window
+TCGA_HG38_loci_for_mapping <- as.data.frame((TCGA_HG38_loci))
+TCGA_HG38_loci_for_mapping <- TCGA_HG38_loci_for_mapping[order(TCGA_HG38_loci_for_mapping[,'Chromosome'],TCGA_HG38_loci_for_mapping[,'left_coordinate_window']),]
+rownames(TCGA_HG38_loci_for_mapping) <- 1:nrow(TCGA_HG38_loci_for_mapping)
+TCGA_HG38_loci_for_mapping <- droplevels(TCGA_HG38_loci_for_mapping)
+target_range <- GRanges((TCGA_HG38_loci_for_mapping$Chromosome), IRanges(start=TCGA_HG38_loci_for_mapping$left_coordinate_window, end=TCGA_HG38_loci_for_mapping$right_coordinate_window))
+
+# Save bulk windows
+#write.table(TCGA_HG38_loci, paste0(resources.dir,"DNAmetBulkSignatures/all_varried_cpgs/bulk_centered_Tiles",2*WINDOW,"_HG38.csv"), quote = FALSE, sep = "\t")
+
+#adjust sc data to windows:
+
+# Calc 1kb window around the bulk CpGs
+mapSCToRRBSTiles = function(file) {
+
+  dataset <- read.table(paste0(coverage.dir,file), header=FALSE, sep="\t")
+  dataset$filename <- basename(file)
+  
+  # Create loci coulmn chromosome:location
+  dataset$V2 <- sub("^[0]+", "", dataset$V2) 
+  dataset$V1 <- sub("chr", "", dataset$V1) 
+  
+  colnames(dataset) <- c("Chromosome","Genomic_Coordinate","Genomic_coordinate_end","percentage","methylated","unmethylated","filename")
+  
+  # Filter to loci of signatre
+  dataset$loci <- paste0(dataset$V1,":",dataset$V2)
+  
+  dataset <- dataset[order(dataset[,'Chromosome'],dataset[,'Genomic_Coordinate']),]
+  rownames(dataset) <- 1:nrow(dataset)
+  d <- GRanges((dataset$Chromosome), IRanges(as.numeric(dataset$Genomic_Coordinate), width=1))
+  
+  OL <- findOverlaps(d, target_range)
+  hits <- TCGA_HG38_loci_for_mapping[as.data.frame(OL)[,2],]
+  hits_in_dataset <- dataset[as.data.frame(OL)[,1],]
+  hits_in_dataset$rrbs_group <- hits$rrbs_group
+  return(hits_in_dataset)
+}
+    
+
+f = function(x, chromosome_field = 'Chromosome', genomic_Coordinate_field = 'Genomic_Coordinate') {
+    
+  chromosome <- (as.integer(x[chromosome_field]))
+  Genomic_Coordinate <- as.integer(x[genomic_Coordinate_field])
+
+  c <- b[(b$chr == chromosome)]
+  rrbs.group.id <- c[(c$start <= Genomic_Coordinate) & (c$end >= Genomic_Coordinate)]$withinGroupID.V1
+  return (rrbs.group.id)
+}
+
+#load sc
+coverage.dir<-paste0(scRRBS.dir,"/COV/")
+file.list <- list.files(path = coverage.dir, recursive = TRUE, pattern = "cov$")
+
+rm(dataset)
+i<-0
+for (file in file.list){
+  
+  print(file)
+  print (i)
+  i <- i +1
+       
+  # if the merged dataset doesn't exist, create it
+  if (!exists("dataset")){
+    dataset <- mapSCToRRBSTiles(file)
+
+
+
+  } else if (exists("dataset")){
+    
+    temp_dataset <-  mapSCToRRBSTiles(file)
+    dataset <- rbind(dataset, temp_dataset)
+  }
+}
+
+
+# Save sc windows
+write.table(dataset, paste0(results.dir,"/all_var_sc_tiles_L",2*WINDOW,"_mean.csv"), quote = FALSE, sep = "\t")
+```
