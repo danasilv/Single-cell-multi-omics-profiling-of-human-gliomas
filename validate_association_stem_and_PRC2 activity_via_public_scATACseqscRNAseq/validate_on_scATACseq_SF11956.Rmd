@@ -1,0 +1,576 @@
+---
+title: "validate_association_stem_and_PRC2 activity_via_public_scATACseqscRNAseq"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## R Markdown
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(plotrix)
+library(stringr)
+library(useful)
+library(glmnet)
+library(igraph)
+library(matrixStats)
+library(SummarizedExperiment)
+library(Signac)
+library(Seurat)
+library(GenomeInfoDb)
+library(ggplot2)
+library(EnsDb.Hsapiens.v86)
+set.seed(1234)
+```
+
+```{r resources and data}
+# The code is based on signac vignette from the satija lab. Here we re-analyzed data of GBM single-cell assay for transposase-accessible chromatin sequencing (scATACseq) from Wang et. al. GBM cells revealed clusters associated with the four core malignant cellular states described by scRNAseq in Neftel et. al. Gene expression activity inferred from scATAC-seq open chromatin (Methods) revealed a positive correlation between PRC2 targets accessibility and NPC/OPC-like cellular states in single-cells.
+
+# The folder should contain GBM signatures from the study: Neftel C, Laffy J, Filbin MG, Hara T, ... , Tirosh I, Suvà ML. An Integrative Model of Cellular States, Plasticity, and Genetics for Glioblastoma. Cell. 2019 Aug 8;178(4):835-849.e21. doi: 10.1016/j.cell.2019.06.024. Epub 2019 Jul 18. PMID: 31327527; PMCID: PMC6703186. A copy of these signatures is also in the github folder of this project: /validate_association_stem_and_PRC2 activity_via_public_scATACseqscRNAseq/resources/ 
+resources.dir =  "..."
+
+# The folder should contain the publicly available data for tumor SF11956 (scATACseq: EGAF00002559211, scRNAseq: SF11956/RNA), from the study: Wang L, Babikir H, Müller S, Yagnik G et al. The Phenotypes of Proliferating Glioblastoma Cells Reside on a Single Axis of Variation. Cancer Discov 2019 Dec;9(12):1708-1719. PMID: 31554641
+# To run it you will need to download or create the following files from EGA: 
+# EGAF00002559211/aggr_normalized/outs/filtered_peak_bc_matrix.h5
+# EGAF00002559211/aggr_normalized/outs/singlecell.csv
+# EGAF00002559211/aggr_normalized/outs/fragments.tsv.gz
+# EGAF00002559211/aggr_normalized/outs/fragments_filtered.tsv.gz 
+# count tables can be found here: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE138794
+# To project RNA signatures you will need the corresponfdind scRNAseq of tumor SF11956, available in EGA
+# All data was created and published by Wang et. al. 
+my.folder <- "..."
+```
+
+```{r read ATACseq}
+
+counts <- Read10X_h5(filename = paste0(my.folder, "/EGAF00002559211/aggr_normalized/outs/filtered_peak_bc_matrix.h5"))
+metadata <- read.csv(file = paste0(my.folder, "EGAF00002559211/aggr_normalized/outs/singlecell.csv"),
+  header = TRUE,
+  row.names = 1
+)
+
+scATAC.data <- CreateSeuratObject(
+  counts = counts,
+  assay = 'peaks',
+  project = 'ATAC',
+  min.cells = 1,
+  meta.data = metadata
+)
+
+### Create UMAP
+fragment.path <- paste0(my.folder,'/EGAF00002559211/aggr_normalized/outs/fragments.tsv.gz')
+filtered.fragment.path <- paste0(my.folder,'/EGAF00002559211/aggr_normalized/outs/fragments_filtered.tsv.bgz')
+
+# read fragments
+scATAC.data <- SetFragments(
+  object = scATAC.data,
+  file = filtered.fragment.path
+) 
+
+scATAC.data <- NucleosomeSignal(object = scATAC.data)
+scATAC.data$pct_reads_in_peaks <- scATAC.data$peak_region_fragments / scATAC.data$passed_filters * 100
+scATAC.data$blacklist_ratio <- scATAC.data$blacklist_region_fragments / scATAC.data$peak_region_fragments
+
+VlnPlot(
+  object = scATAC.data,
+  features = c('pct_reads_in_peaks', 'blacklist_ratio', 'nucleosome_signal', 'peak_region_fragments'),
+  pt.size = 0.1,
+  ncol = 2) + NoLegend()
+```
+
+```{r show nucleosome_groups}
+scATAC.data$nucleosome_group <- ifelse(scATAC.data$nucleosome_signal > 3, 'NS > 2', 'NS < 2')
+FragmentHistogram(object = scATAC.data, group.by = 'nucleosome_group')
+```
+
+```{r cluster ATACseq}
+# create granges object with TSS positions
+gene.ranges <- genes(EnsDb.Hsapiens.v86)
+gene.ranges <- gene.ranges[gene.ranges$gene_biotype == 'protein_coding', ]
+
+tss.ranges <- GRanges(
+  seqnames = seqnames(gene.ranges),
+  ranges = IRanges(start = start(gene.ranges), width = 2),
+  strand = strand(gene.ranges)
+)
+
+seqlevelsStyle(tss.ranges) <- 'UCSC'
+tss.ranges <- keepStandardChromosomes(tss.ranges, pruning.mode = 'coarse')
+
+tss.ranges <- tss.ranges[tss.ranges@seqnames != 'chrM',]
+scATAC.data <- TSSEnrichment(object = scATAC.data, tss.positions = tss.ranges)
+
+scATAC.data$high.tss <- ifelse(scATAC.data$TSS.enrichment > 2, 'High', 'Low')
+TSSPlot(scATAC.data, group.by = 'high.tss') + ggtitle("TSS enrichment score") + NoLegend()
+
+# QC filetring
+scATAC.data <- subset(scATAC.data, subset = peak_region_fragments > 1000 & peak_region_fragments < 14000 & pct_reads_in_peaks > 15  & pct_reads_in_peaks > 78 & blacklist_ratio < 0.05 & nucleosome_signal < 2.5 & TSS.enrichment > 2)
+
+scATAC.data <- RunTFIDF(scATAC.data)
+scATAC.data <- FindTopFeatures(scATAC.data, min.cutoff = 'q0')
+scATAC.data <- RunSVD(
+  object = scATAC.data,
+  assay = 'peaks',
+  reduction.key = 'LSI_',
+  reduction.name = 'lsi'
+)
+
+scATAC.data <- RunUMAP(object = scATAC.data, reduction = 'lsi', dims = 1:20)
+scATAC.data <- FindNeighbors(object = scATAC.data, reduction = 'lsi', dims = 1:20)
+scATAC.data <- FindClusters(object = scATAC.data, verbose = FALSE)
+DimPlot(object = scATAC.data, label = TRUE) + NoLegend()
+```
+
+``` {r find malignant cells using chr7 and chr 10}
+
+DefaultAssay(scATAC.data) <- 'peaks'
+
+peaks_chr7 <- rownames(scATAC.data@assays$peaks)[startsWith(rownames(scATAC.data@assays$peaks),"chr7")]
+peaks_chr10 <- rownames(scATAC.data@assays$peaks)[startsWith(rownames(scATAC.data@assays$peaks),"chr10")]
+
+scATAC.data <- AddModuleScore(scATAC.data, features = peaks_chr7, names = "chr7")
+scATAC.data <- AddModuleScore(scATAC.data, features = peaks_chr10, names = "chr10")
+
+FeaturePlot(scATAC.data, features = c("chr71"),  
+            pt.size = 0.02, max.cutoff = 'q95',
+            min.cutoff = 'q5',
+            ncol = 3)
+
+FeaturePlot(scATAC.data, features = c("chr71"))
+
+```
+
+``` {r matching scRNA}
+library(dplyr)
+library(Seurat)
+
+# Load the scATAC.data dataset
+rna.data <- Read10X(data.dir = paste0(my.dir,"/SF11956/RNA/"), gene.column=1)
+# Initialize the Seurat object with the raw (non-normalized data).
+rna <- CreateSeuratObject(counts = rna.data, project = "RNA", min.cells = 3, min.features = 200)
+rna
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+rna[["percent.mt"]] <- PercentageFeatureSet(rna, pattern = "^MT-")
+# Visualize QC metrics as a violin plot
+VlnPlot(rna, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+```
+
+``` {r FeatureScatter}
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(rna, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(rna, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+CombinePlots(plots = list(plot1, plot2))
+
+```
+``` {r subset data}
+rna <- subset(rna, subset = nCount_RNA < 9000 & nFeature_RNA > 700 & nFeature_RNA < 3000 & percent.mt < 8)
+``` 
+``` {r normalize}
+rna <- NormalizeData(rna, normalization.method = "LogNormalize", scale.factor = 10000)
+``` 
+
+``` {r VariableFeatures}
+rna <- FindVariableFeatures(rna, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(rna), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(rna)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+``` 
+
+``` {r scale}
+all.genes <- rownames(rna)
+rna <- ScaleData(rna, features = all.genes)
+```
+
+``` {r heatmap of features}
+rna <- RunPCA(rna, features = VariableFeatures(object = rna))
+VizDimLoadings(rna, dims = 1:2, reduction = "pca")
+DimHeatmap(rna, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+``` {r Determine the ‘dimensionality’ of the dataset}
+rna <- JackStraw(rna, num.replicate = 100)
+rna <- ScoreJackStraw(rna, dims = 1:20)
+```
+``` {r JackStrawPlot}
+JackStrawPlot(rna, dims = 1:15)
+```
+``` {r ElbowPlot}
+ElbowPlot(rna)
+``` 
+``` {r rna umap}
+rna <- FindNeighbors(rna, dims = 1:5)
+rna <- FindClusters(rna, resolution = 0.5)
+rna <- RunUMAP(rna, dims = 1:5)
+DimPlot(rna, reduction = "umap")
+``` 
+```{r find immune cells}
+FeaturePlot(rna, features = c("CD4","CD8","CD163","CD3")) # immune cells markers, to further distinguish immune and malignant cells
+```
+```{r clean  out immune cells}
+cell.to.keep <- rownames(rna@meta.data[(rna@meta.data$seurat_clusters != 6) & (rna@meta.data$seurat_clusters != 7),])
+rna.malignant <- subset(rna, cells = cell.to.keep)
+```
+
+
+``` {r filter to only super high quality cells}
+VlnPlot(rna.malignant, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+``` {r}
+rna.malignant <- subset(rna.malignant, subset = nCount_RNA < 4500 & nFeature_RNA > 700 & nFeature_RNA < 2000 & percent.mt < 8)
+
+```
+
+``` {r normalize rna malignant}
+rna.malignant <- NormalizeData(rna.malignant, normalization.method = "LogNormalize", scale.factor = 10000)
+``` 
+
+``` {r plot something I dont know}
+rna.malignant <- FindVariableFeatures(rna.malignant, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(rna.malignant), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(rna.malignant)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+``` 
+
+``` {r scale rna malignant}
+all.genes <- rownames(rna.malignant)
+rna.malignant <- ScaleData(rna.malignant, features = all.genes)
+```
+
+``` {r heatmap for rna malignant dimensions}
+rna.malignant <- RunPCA(rna.malignant, features = VariableFeatures(object = rna))
+VizDimLoadings(rna.malignant, dims = 1:2, reduction = "pca")
+DimHeatmap(rna.malignant, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+``` {r Determine the ‘dimensionality’ of the rna malignant dataset}
+rna.malignant <- JackStraw(rna.malignant, num.replicate = 100)
+rna.malignant <- ScoreJackStraw(rna.malignant, dims = 1:20)
+```
+``` {r JackStrawPlot rna malignant}
+JackStrawPlot(rna.malignant, dims = 1:15)
+```
+``` {r ElbowPlot rna malignant}
+ElbowPlot(rna.malignant)
+``` 
+``` {r clusters for rna malignan}
+rna.malignant <- FindNeighbors(rna.malignant, dims = 1:4)
+rna.malignant <- FindClusters(rna.malignant, resolution = 0.2)
+rna.malignant <- RunUMAP(rna.malignant, dims = 1:4)
+DimPlot(rna.malignant, reduction = "umap")
+``` 
+
+
+```{r check that there are no non malignant in rna malignan}
+FeaturePlot(rna.malignant, features = c("nCount_RNA","nFeature_RNA","percent.mt"))
+FeaturePlot(rna.malignant, features = c("CD4","CD8","CD163","CD3"))
+
+```
+
+```{r calc sigantures rna malignan}
+addModuleScore2RNA <- function(seurat.object, sig.name, TFs = 0){
+  sig.genes <- readLines(paste0(resources.dir,"/",sig.name,"_genes.txt"))
+  sig.genes <- (list(intersect(rownames(seurat.object),sig.genes)))[[1]]
+  if (TFs != 0) {
+    sig.genes <- list(intersect(TFs,sig.genes))[[1]]
+    sig.name <- paste0(sig.name,"_TFsonly")
+  }
+  print(length(sig.genes))
+  if (length(sig.genes) < 2){
+    return(seurat.object)
+  }
+  else
+  {
+    seurat.object <- AddModuleScore(seurat.object, features = sig.genes ,name = sig.name)
+    return(seurat.object)
+
+  }
+}
+addTwoModuleScore2RNA <- function(seurat.object, sig1.name,sig2.name, new.name, TFs = 0){
+  sig1.genes <- readLines(paste0(resources.dir,"/",sig1.name,"_genes.txt"))
+  sig2.genes <- readLines(paste0(resources.dir,"/",sig2.name,"_genes.txt"))
+  sig.genes <- append(sig1.genes, sig2.genes)
+  sig.genes <- (list(intersect(rownames(seurat.object),sig.genes)))[[1]]
+  if (TFs != 0) {
+    sig.genes <- list(intersect(TFs,sig.genes))[[1]]
+    sig.name <- paste0(new.name,"_TFsonly")
+  }
+  print(length(sig.genes))
+  if (length(sig.genes) < 2){
+    return(seurat.object)
+  }
+  else
+  {
+    seurat.object <- AddModuleScore(seurat.object, features = sig.genes ,name = new.name)
+    return(seurat.object)
+
+  }
+}
+
+addThreeModuleScore2RNA <- function(seurat.object, sig1.name,sig2.name, sig3.name, new.name, TFs = 0){
+  sig1.genes <- readLines(paste0(resources.dir,"/",sig1.name,"_genes.txt"))
+  sig2.genes <- readLines(paste0(resources.dir,"/",sig2.name,"_genes.txt"))
+  sig3.genes <- readLines(paste0(resources.dir,"/",sig3.name,"_genes.txt"))
+
+  sig.genes <- append(sig1.genes, sig2.genes)
+  sig.genes <- append(sig.genes, sig3.genes)
+    
+  sig.genes <- (list(intersect(rownames(seurat.object),sig.genes)))[[1]]
+  if (TFs != 0) {
+    sig.genes <- list(intersect(TFs,sig.genes))[[1]]
+    sig.name <- paste0(new.name,"_TFsonly")
+  }
+  print(length(sig.genes))
+  if (length(sig.genes) < 2){
+    return(seurat.object)
+  }
+  else
+  {
+    seurat.object <- AddModuleScore(seurat.object, features = sig.genes ,name = new.name)
+    return(seurat.object)
+
+  }
+}
+
+
+rna.malignant <- addModuleScore2RNA(rna.malignant,"npc1")
+rna.malignant <-addModuleScore2RNA(rna.malignant,"npc2")
+rna.malignant <-addModuleScore2RNA(rna.malignant,"mes1")
+rna.malignant <-addModuleScore2RNA(rna.malignant,"mes2")
+rna.malignant <-addModuleScore2RNA(rna.malignant,"opc")
+rna.malignant <-addModuleScore2RNA(rna.malignant,"ac")
+rna.malignant <- addTwoModuleScore2RNA(rna.malignant,"npc1","npc2","npc")
+rna.malignant <- addTwoModuleScore2RNA(rna.malignant,"mes1","mes2","mes")
+rna.malignant <- addThreeModuleScore2RNA(rna.malignant,"mes1","mes2","ac","diff")
+rna.malignant <- addThreeModuleScore2RNA(rna.malignant,"npc1","npc2","opc","stem")
+
+prc2.genes <- read.table(paste0(resources.dir,'/BENPORATH_PRC2_TARGETS.txt'))$V1
+prc2.genes <- list(intersect(rownames(rna.malignant), prc2.genes))
+rna.malignant <- AddModuleScore(rna.malignant, features = prc2.genes ,name = "prc2")
+
+
+FeaturePlot(rna.malignant, features = c("npc11","npc21","mes11","mes21","opc1","ac1","stem1","diff1"),  
+             pt.size = 0.02,)
+```
+
+``` {r gene activity for scATAC.data}
+umap_coordinates <- Embeddings(scATAC.data[["umap"]])
+
+### Create a gene activity matrix
+# extract gene coordinates from Ensembl, and ensure name formatting is consistent with Seurat object 
+gene.coords <- genes(EnsDb.Hsapiens.v86, filter = ~ gene_biotype == "protein_coding")
+seqlevelsStyle(gene.coords) <- 'UCSC'
+genebody.coords <- keepStandardChromosomes(gene.coords, pruning.mode = 'coarse')
+genebodyandpromoter.coords <- Extend(x = gene.coords, upstream = 2000, downstream = 0)
+
+# create a gene by cell matrix
+gene.activities <- FeatureMatrix(
+  fragments = paste0(my.folder,'/EGAF00002559211/aggr_normalized/outs/fragments_filtered.tsv.bgz'),
+  features = genebodyandpromoter.coords,
+  cells = colnames(scATAC.data),
+  chunk = 20
+)
+
+# convert rownames from chromsomal coordinates into gene names
+gene.key <- genebodyandpromoter.coords$gene_name
+names(gene.key) <- GRangesToString(grange = genebodyandpromoter.coords)
+rownames(gene.activities) <- gene.key[rownames(gene.activities)]
+
+# add the gene activity matrix to the Seurat object as a new assay, and normalize it
+scATAC.data[['RNA']] <- CreateAssayObject(counts = gene.activities)
+scATAC.data <- NormalizeData(
+  object = scATAC.data,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(scATAC.data$nCount_RNA)
+)
+```
+
+
+``` {r match ATACseq and RNA malignant}
+
+DefaultAssay(scATAC.data) <- 'RNA'
+
+transfer.anchors <- FindTransferAnchors(
+  reference = rna,
+  query = scATAC.data,
+  reduction = 'cca'
+)
+
+predicted.labels <- TransferData(
+  anchorset = transfer.anchors,
+  refdata = rna$seurat_clusters,
+  weight.reduction = scATAC.data[['lsi']]
+)
+
+scATAC.data <- AddMetaData(object = scATAC.data, metadata = predicted.labels)
+
+plot1 <- DimPlot(
+  object = rna,
+  group.by = 'seurat_clusters',
+  label = TRUE,
+  repel = TRUE) + NoLegend() + ggtitle('scRNA-seq')
+
+plot2 <- DimPlot(
+  object = scATAC.data,
+  group.by = 'predicted.id',
+  label = TRUE,
+  repel = TRUE) + NoLegend() + ggtitle('scATAC-seq')
+
+CombinePlots(list(plot1,plot2), ncol = 2)
+```
+```{r clean  out immune cells from ATACseq}
+cell.to.keep <- rownames(scATAC.data@meta.data[(scATAC.data@meta.data$predicted.id != 7) | (scATAC.data@meta.data$predicted.id != 6) | (scATAC.data@meta.data$predicted.id != 8),])
+scATAC.data.malignant <- subset(scATAC.data, cells = cell.to.keep)
+```
+
+```{r re cluster scATAC}
+DefaultAssay(scATAC.data.malignant) <- 'peaks'
+
+
+scATAC.data.malignant <- RunTFIDF(scATAC.data.malignant)
+scATAC.data.malignant <- FindTopFeatures(scATAC.data.malignant, min.cutoff = 'q10')
+scATAC.data.malignant <- RunSVD(
+  object = scATAC.data.malignant,
+  assay = 'peaks',
+  reduction.key = 'LSI_',
+  reduction.name = 'lsi'
+)
+
+scATAC.data.malignant <- RunUMAP(object = scATAC.data.malignant, reduction = 'lsi', dims = 1:4)
+scATAC.data.malignant <- FindNeighbors(object = scATAC.data.malignant, reduction = 'lsi', dims = 1:4)
+scATAC.data.malignant <- FindClusters(object = scATAC.data.malignant, verbose = FALSE, resolution = 0.8)
+DimPlot(object = scATAC.data.malignant, label = TRUE) + NoLegend()
+```
+
+```{r find all markers}
+markers.all=FindAllMarkers(scATAC.data.malignant,assay = 'RNA',thresh.test = 3,test.use = "roc", do.print = TRUE)
+```
+
+```{r Look at the gene signatures with add module score}
+umap_coordinates <- Embeddings(scATAC.data.malignant[["umap"]])
+
+### Create a gene activity matrix
+# extract gene coordinates from Ensembl, and ensure name formatting is consistent with Seurat object 
+gene.coords <- genes(EnsDb.Hsapiens.v86, filter = ~ gene_biotype == "protein_coding")
+seqlevelsStyle(gene.coords) <- 'UCSC'
+genebody.coords <- keepStandardChromosomes(gene.coords, pruning.mode = 'coarse')
+genebodyandpromoter.coords <- Extend(x = gene.coords, upstream = 5000, downstream = 0)
+
+# Take promoters
+gene.coords.noM <- gene.coords[gene.coords@seqnames != 'chrM',]
+genepromoter.coords <- promoters(gene.coords.noM)
+genepromoter.coords.2 <- Extend(x = genepromoter.coords, upstream = 0, downstream = 0)
+
+# create a gene by cell matrix
+gene.activities.promoters <- FeatureMatrix(
+  fragments = paste0(my.folder,'/EGAF00002559211/aggr_normalized/outs/fragments_filtered.tsv.bgz'),
+  features = genepromoter.coords.2,
+  cells = colnames(scATAC.data.malignant),
+  chunk = 20
+)
+
+
+# create a gene by cell matrix
+gene.activities <- FeatureMatrix(
+  fragments = paste0(my.folder,'/EGAF00002559211/aggr_normalized/outs/fragments_filtered.tsv.bgz'),
+  features = genebodyandpromoter.coords,
+  cells = colnames(scATAC.data.malignant),
+  chunk = 20
+)
+
+
+# convert rownames from chromsomal coordinates into gene names
+gene.key <- genebodyandpromoter.coords$gene_name
+names(gene.key) <- GRangesToString(grange = genebodyandpromoter.coords)
+rownames(gene.activities) <- gene.key[rownames(gene.activities)]
+
+
+# add the gene activity matrix to the Seurat object as a new assay, and normalize it
+scATAC.data.malignant[['RNA']] <- CreateAssayObject(counts = gene.activities)
+scATAC.data.malignant <- NormalizeData(
+  object = scATAC.data.malignant,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(scATAC.data.malignant$nCount_RNA)
+)
+
+# convert rownames from chromsomal coordinates into gene names
+gene.key <- genepromoter.coords.2$gene_name
+names(gene.key) <- GRangesToString(grange = genepromoter.coords.2)
+rownames(gene.activities.promoters) <- gene.key[rownames(gene.activities.promoters)]
+
+# add the gene activity matrix to the Seurat object as a new assay, and normalize it
+scATAC.data.malignant[['RNApromoters']] <- CreateAssayObject(counts = gene.activities.promoters)
+scATAC.data.malignant <- NormalizeData(
+  object = scATAC.data.malignant,
+  assay = 'RNApromoters',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(scATAC.data.malignant$nCount_RNA)
+)
+
+
+# programs
+DefaultAssay(scATAC.data.malignant) <- 'RNA'
+
+# Add the GBM2 signatures
+resources.dir =  "/Volumes/broad_regevtmp/dsilverb/Glioma_scRRBS/resources/"
+
+
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(readLines(paste0(resources.dir,"/npc1_genes.txt"))), name = "npc1")
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(readLines(paste0(resources.dir,"/npc2_genes.txt"))), name = "npc2")
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(readLines(paste0(resources.dir,"/mes1_genes.txt"))), name = "mes1")
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(readLines(paste0(resources.dir,"/mes2_genes.txt"))), name = "mes2")
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(readLines(paste0(resources.dir,"/opc_genes.txt"))), name = "opc")
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(readLines(paste0(resources.dir,"/ac_genes.txt"))), name = "ac")
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(prc2.genes), name = "PRC2targets")
+
+npc.genes <- append(readLines(paste0(resources.dir,"/npc1_genes.txt")),readLines(paste0(resources.dir,"/npc2_genes.txt"))) 
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(npc.genes), name = "npc")
+
+mes.genes <- append(readLines(paste0(resources.dir,"/mes1_genes.txt")),readLines(paste0(resources.dir,"/mes2_genes.txt")))
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(mes.genes), name = "mes")
+
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(append(mes.genes,readLines(paste0(resources.dir,"/ac_genes.txt")))), name = "diff")
+scATAC.data.malignant <- AddModuleScore(scATAC.data.malignant, features = list(append(npc.genes,readLines(paste0(resources.dir,"/opc_genes.txt")))), name = "stem")
+
+scATAC.data.malignant@meta.data$acMopc <- scATAC.data.malignant@meta.data$ac1 - scATAC.data.malignant@meta.data$opc1
+scATAC.data.malignant@meta.data$opcMac <- scATAC.data.malignant@meta.data$opc1 - scATAC.data.malignant@meta.data$ac1
+
+
+FeaturePlot(scATAC.data.malignant, features = c("opc","ac","npc1","npc2","mes1","mes2","stem","diff","PRC2targets"),  
+            pt.size = 0.02, max.cutoff = 'q95',
+            min.cutoff = 'q5',
+            ncol = 3)
+```
+
+```{r check count and features, fig.width = 10, fig.height= 4}
+
+FeaturePlot(
+  object = scATAC.data.malignant,
+  features = c("nCount_RNA","nFeature_RNA"),
+  pt.size = 3,
+  max.cutoff = 'q95',
+  min.cutoff = 'q5',
+  ncol = 3,
+  cols = c('blue',"gray","red"),
+  blend = FALSE,
+  blend.threshold = 0.3,
+)
+
+```
+
