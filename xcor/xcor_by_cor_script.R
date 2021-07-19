@@ -18,8 +18,8 @@ source("xcor_functions.R")
 neftel_genes <- readRDS("../RNA_velocity/neftel_genes.RDS")
 
 # load MGH115 and MGH122 phylogeny lists
-mgh115.list <- readRDS("../mgh115-list.RDS")
-mgh122.list <- readRDS("../mgh122-list.RDS")
+mgh115.list <- readRDS("mgh115-list.RDS")
+mgh122.list <- readRDS("mgh122-list.RDS")
 
 # compute xcor and cor
 xcorXcor115 <- get_xcor_by_cor_df(mgh115.list, "tpm")
