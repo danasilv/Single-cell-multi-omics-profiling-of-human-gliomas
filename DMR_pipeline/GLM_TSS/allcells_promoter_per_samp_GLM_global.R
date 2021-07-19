@@ -34,14 +34,14 @@ ct = c( args[3] ,  args[4] )
 cell_info <- read.table("GBM_cellscores.txt", header=T, stringsAsFactors = F )
 cell_info$meth_cell <- gsub( ".cov", ".binarize.promoters.1kb.cov" , cell_info$meth_cell )
 
-## do two groups comparison
+## do two groups comparison (e.g. differentiated vs. stem-like cells)
 cell_info$Type2[ grep("^AC|^MES", cell_info$Type1) ] <- "Diff"
 cell_info$Type2[ grep("^NPC|^OPC", cell_info$Type1) ] <- "Stem"
 
 ## Take cells corresponding to cell types
 chosen = cell_info
 
-## Define Global pathway methylation (avg of all pathways per cell)
+## Define Global pathway methylation (avg of all promoters per cell)
 tmp_meth = mapply(as.numeric.factor, meth)
 global = colMeans(tmp_meth, na.rm = T)
 
@@ -71,7 +71,7 @@ tmp = data.frame()
                   df$group <- NA
                   df$group <- chosen$Type2[ match(df$cell, chosen$meth_cell) ]                
 
-	              df$group[ grep( sprintf("^%s", ct[1]) , df$group ) ] <- ct[1] ; 
+	          df$group[ grep( sprintf("^%s", ct[1]) , df$group ) ] <- ct[1] ; 
                   df$group[ grep( sprintf("^%s", ct[2]) , df$group ) ] <- ct[2] ;
 
 		  df <- df[ df$group %in% ct , ]
@@ -100,7 +100,7 @@ tmp = data.frame()
                  
 		  if ( ! ( ( t1 >= 10 ) & ( t2 >= 10 ) ) ) next
 
-                  ### Add global pathway methylation to the data frame
+                  ### Add global methylation to the data frame
                   df$global <- global[ match(df$cell, names(global)) ]
                   
                   samp1 = df
