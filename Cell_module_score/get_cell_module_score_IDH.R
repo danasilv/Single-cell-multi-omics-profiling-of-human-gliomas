@@ -22,7 +22,7 @@ for (m in 1:length(patients)) {
   ## Patient 
   patient = patients[m]
   print(patient)
-  ## Read in RSEM TPM
+  ## Read in TPM count matrices
   tpm = read.table( paste0( "/Gene_counts/",patient, ".tpm.txt")  )
   
   qc = read.table("IDH_filtered_cells.txt")
