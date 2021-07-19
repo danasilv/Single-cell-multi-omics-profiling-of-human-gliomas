@@ -10,7 +10,7 @@ library(dplyr)
 source("xcor_functions.R")
 
 # load phylogenies
-tree.list <- readRDS("../treelist.RDS")
+tree.list <- readRDS("treelist.RDS")
 
 # GBM tree replicate indices in tree.list
 id1 <- 1:110

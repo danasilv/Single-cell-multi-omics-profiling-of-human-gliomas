@@ -16,7 +16,7 @@ library(adephylo)
 source("bisse_functions.R")
 
 # load phylogenies
-tree.list <- readRDS("../treelist.RDS")
+tree.list <- readRDS("../xcor/treelist.RDS")
 
 # run BiSSE MLE on all phylogenies (note: this can take a while)
 bisse.out <- list()

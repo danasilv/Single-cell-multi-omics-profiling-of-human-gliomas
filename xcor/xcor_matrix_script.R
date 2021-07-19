@@ -11,7 +11,7 @@ library(reshape2)
 # load xcor functions
 source("xcor_functions.R")
 # load all phylogenies
-tree.list <- readRDS("../treelist.RDS")
+tree.list <- readRDS("treelist.RDS")
 
 # get mean cross-correlation Z-score matrices
 xcor115 <- get_xcor_matrix("MGH115")

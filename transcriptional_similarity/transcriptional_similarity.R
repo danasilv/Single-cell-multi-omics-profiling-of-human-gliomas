@@ -34,7 +34,7 @@ transcriptional.similarity <- function(tree, num_tests=10^4) {
 }
 
 # load phylogenies
-tree.list <- readRDS("../treelist.RDS")
+tree.list <- readRDS("../xcor/treelist.RDS")
 
 # output data frame of transcriptional similarity Z-scores
 tsdf <- data.frame("bio.rep"=sapply(tree.list, '[[', "bio.rep"), "sample"=sapply(tree.list, '[[', "sample_name"),
