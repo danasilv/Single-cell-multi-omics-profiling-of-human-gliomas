@@ -86,11 +86,10 @@ def rawMethFileConverterChr(wd,inputFile,outputFile,cancerType):
     tumor = normDf[mask0]
     normal = normDf[mask1]
     
-    #Copy number is given as:  CNV = cell_cpgs / mean( normal_cpgs )
-    #calculate the mean normal cpgs
-    meanNormal = normal.mean(axis = 0)
+    #Copy number is given as:  CNV = cell_cpgs / median( normal_cpgs )
+    medianNormal = normal.median(axis = 0)
     
-    cnv = tumor.div(meanNormal)
+    cnv = tumor.div(medianNormal)
     cnv = cnv.apply(np.log2)
     cnv = cnv.fillna(0)
     cnv = cnv.replace(np.inf,0)
@@ -135,11 +134,10 @@ def rawMethFileConverter(wd,inputFile,outputFile,cancerType,resample):
     tumor = normDf[mask0]
     normal = normDf[mask1]
     
-    #Copy number is given as:  CNV = cell_cpgs / mean( normal_cpgs )
-    #calculate the mean normal cpgs
-    meanNormal = normal.mean(axis = 0)
+    #Copy number is given as:  CNV = cell_cpgs / median( normal_cpgs )
+    medianNormal = normal.median(axis = 0)
     
-    cnv = tumor.div(meanNormal)
+    cnv = tumor.div(medianNormal)
     cnv = cnv.apply(np.log2)
     cnv = cnv.fillna(0)
     cnv = cnv.replace(np.inf,0)
