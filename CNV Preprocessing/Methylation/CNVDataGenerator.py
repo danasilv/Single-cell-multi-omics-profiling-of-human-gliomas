@@ -35,8 +35,7 @@ mask1 = [x.startswith(groups[1]) for x in list(normDf.index)]
 tumor = normDf[mask0]
 normal = normDf[mask1]
 
-#Copy number is given as:  CNV = cell_cpgs / mean( normal_cpgs )
-#calculate the mean normal cpgs
+#Copy number is given as:  CNV = cell_cpgs / median( normal_cpgs )
 medianNormal = normal.median(axis = 0)
 
 cnv = tumor.div(medianNormal)
